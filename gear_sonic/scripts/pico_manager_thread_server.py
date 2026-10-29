@@ -2115,7 +2115,9 @@ def run_pico_manager(
             if new_mode != current_mode:
                 if new_mode == StreamMode.OFF:
                     socket.send(build_command_message(start=False, stop=True, planner=True))
-                    exit()
+                    print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
+                    current_mode = new_mode
+                    return
                 elif (
                     new_mode == StreamMode.PLANNER
                     or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
@@ -2155,6 +2157,8 @@ def run_pico_manager(
     finally:
         # Cleanup resources
         reader.stop()
+        if input_source == "xrt" and xrt is not None:
+            xrt.close()
         three_point.close()
         socket.close()
         context.term()
