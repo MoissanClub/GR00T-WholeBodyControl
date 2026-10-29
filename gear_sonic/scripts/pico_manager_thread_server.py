@@ -36,6 +36,7 @@ import torch
 import zmq
 
 from gear_sonic.utils.teleop import input_readers
+from gear_sonic.utils.teleop.chord_latch import FullReleaseChordLatch
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
@@ -1988,7 +1989,7 @@ def run_pico_manager(
     try:
         prev_ax_pressed = False
         prev_by_pressed = False
-        prev_start_combo = False
+        start_combo_latch = FullReleaseChordLatch()
         prev_left_axis_click = False
         while True:
             # Poll Pico controller for buttons/axes
@@ -2004,12 +2005,16 @@ def run_pico_manager(
             # Rising edge: B+Y pressed together -> toggle POSE/PLANNER_FROZEN_UPPER_BODY mode
             by_pressed = (b_pressed) and (y_pressed)
 
-            # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
+            # Full-release latch: a transient dropped-button sample while the
+            # chord remains held must not create a second start/stop event.
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+            start_combo_event = start_combo_latch.update(
+                (a_pressed, b_pressed, x_pressed, y_pressed)
+            )
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
-                if start_combo and not prev_start_combo:
+                if start_combo_event:
                     new_mode = StreamMode.PLANNER
                     # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
                     # Uses the current Pico SMPL frame + FK of all-zero body joints.
@@ -2021,7 +2026,7 @@ def run_pico_manager(
 
             elif current_mode == StreamMode.PLANNER:
                 # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
-                if start_combo and not prev_start_combo:
+                if start_combo_event:
                     new_mode = StreamMode.OFF
                 elif ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.POSE
@@ -2029,7 +2034,7 @@ def run_pico_manager(
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE:
-                if start_combo and not prev_start_combo:
+                if start_combo_event:
                     new_mode = StreamMode.OFF
                 elif ax_pressed and not prev_ax_pressed:
                     new_mode = StreamMode.PLANNER  # Enter chain 2
@@ -2040,7 +2045,7 @@ def run_pico_manager(
 
             elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                 # Chain 1: POSE <--(by)--> FROZEN <--(left_axis_click)--> VR_3PT
-                if start_combo and not prev_start_combo:
+                if start_combo_event:
                     new_mode = StreamMode.OFF
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
@@ -2048,7 +2053,7 @@ def run_pico_manager(
                     new_mode = StreamMode.PLANNER_VR_3PT
 
             elif current_mode == StreamMode.POSE_PAUSE:
-                if start_combo and not prev_start_combo:
+                if start_combo_event:
                     new_mode = StreamMode.OFF
                 elif not left_menu_button:
                     new_mode = StreamMode.POSE
@@ -2058,7 +2063,7 @@ def run_pico_manager(
                 #   left_axis_click → return to parent (PLANNER or FROZEN)
                 #   ax_pressed      → POSE (chain 2 exit)
                 #   by_pressed      → POSE (chain 1 exit)
-                if start_combo and not prev_start_combo:
+                if start_combo_event:
                     new_mode = StreamMode.OFF
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = vr3pt_parent_mode  # Return to parent mode
@@ -2143,7 +2148,6 @@ def run_pico_manager(
 
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed
-            prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
 
     except KeyboardInterrupt:
