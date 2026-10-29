@@ -38,6 +38,7 @@ import zmq
 from gear_sonic.utils.teleop import input_readers
 from gear_sonic.utils.teleop.chord_latch import FullReleaseChordLatch
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
+from gear_sonic.utils.teleop.zmq.packet_capture import RecordingSocket
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
     angle_axis_to_quaternion,
@@ -1540,6 +1541,13 @@ class PoseStreamer:
             }
 
             packed_message = pack_pose_message(numpy_data, topic="pose")
+            if hasattr(self.socket, "set_pose_context"):
+                self.socket.set_pose_context(
+                    sample["body_poses_np"],
+                    device_timestamp_ns=int(sample.get("timestamp_ns", 0)),
+                    sample_realtime_s=float(sample.get("timestamp_realtime", 0.0)),
+                    sample_monotonic_s=float(sample.get("timestamp_monotonic", 0.0)),
+                )
             self.socket.send(packed_message)
 
             if self.record_dir:
@@ -1906,6 +1914,7 @@ def run_pico_manager(
     use_cuda: bool = False,
     record_dir: str = "",
     record_format: str = "npz",
+    packet_record_dir: str = "",
     zmq_feedback_host: str = "localhost",
     zmq_feedback_port: int = 5557,
     enable_vis_vr3pt: bool = False,
@@ -1925,6 +1934,9 @@ def run_pico_manager(
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
+    if packet_record_dir:
+        socket = RecordingSocket(socket, packet_record_dir)
+        print(f"[Manager] Exact packet capture: {packet_record_dir}")
     time.sleep(0.1)
     print(f"[Manager] ZMQ socket bound to port {port}")
 
@@ -1995,9 +2007,41 @@ def run_pico_manager(
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
 
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs(reader)
+            (
+                left_menu_button,
+                left_trigger_mgr,
+                right_trigger_mgr,
+                left_grip_mgr,
+                right_grip_mgr,
+            ) = get_controller_inputs(reader)
 
-            left_axis_click, _ = get_axis_clicks(reader)
+            left_axis_click, right_axis_click = get_axis_clicks(reader)
+            left_x_mgr, left_y_mgr, right_x_mgr, right_y_mgr = get_controller_axes(reader)
+
+            if hasattr(socket, "record_input_sample"):
+                input_sample = reader.get_latest()
+                if input_sample is not None:
+                    socket.record_input_sample(
+                        input_sample["body_poses_np"],
+                        device_timestamp_ns=int(input_sample.get("timestamp_ns", 0)),
+                        sample_realtime_s=float(input_sample.get("timestamp_realtime", 0.0)),
+                        sample_monotonic_s=float(input_sample.get("timestamp_monotonic", 0.0)),
+                        controls={
+                            "a": bool(a_pressed),
+                            "b": bool(b_pressed),
+                            "x": bool(x_pressed),
+                            "y": bool(y_pressed),
+                            "left_menu": bool(left_menu_button),
+                            "left_axis_click": bool(left_axis_click),
+                            "right_axis_click": bool(right_axis_click),
+                            "left_trigger": float(left_trigger_mgr),
+                            "right_trigger": float(right_trigger_mgr),
+                            "left_grip": float(left_grip_mgr),
+                            "right_grip": float(right_grip_mgr),
+                            "left_axis": [float(left_x_mgr), float(left_y_mgr)],
+                            "right_axis": [float(right_x_mgr), float(right_y_mgr)],
+                        },
+                    )
 
             # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
             ax_pressed = (a_pressed) and (x_pressed)
@@ -2102,6 +2146,8 @@ def run_pico_manager(
                     planner_streamer.recalibrate_for_vr3pt()
 
             # Run one iteration of the new mode
+            if hasattr(socket, "set_mode"):
+                socket.set_mode(new_mode.name)
             if new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
             elif (
@@ -2190,6 +2236,11 @@ if __name__ == "__main__":
         type=str,
         default="npz",
         help="Recording format: 'npz' or 'bin' (default: npz)",
+    )
+    parser.add_argument(
+        "--packet-record-dir",
+        default="",
+        help="Directory for exact ZMQ packets plus aligned raw XR body poses.",
     )
     parser.add_argument(
         "--manager",
@@ -2293,6 +2344,7 @@ if __name__ == "__main__":
             use_cuda=args.cuda,
             record_dir=args.record_dir,
             record_format=args.record_format,
+            packet_record_dir=args.packet_record_dir,
             zmq_feedback_host=args.zmq_feedback_host,
             zmq_feedback_port=args.zmq_feedback_port,
             enable_vis_vr3pt=args.vis_vr3pt,
