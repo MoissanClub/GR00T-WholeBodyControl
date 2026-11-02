@@ -37,8 +37,10 @@ import zmq
 
 from gear_sonic.utils.teleop import input_readers
 from gear_sonic.utils.teleop.chord_latch import FullReleaseChordLatch
+from gear_sonic.utils.teleop.xr_preflight import XRPreflightMonitor
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from gear_sonic.utils.teleop.zmq.packet_capture import RecordingSocket
+from gear_sonic.utils.data_collection.text_to_speech import TextToSpeech
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
     angle_axis_to_quaternion,
@@ -1577,6 +1579,7 @@ class PoseStreamer:
 def _init_input_source(
     input_source: str,
     buffer_size: int,
+    waiting_callback=None,
 ) -> "PicoReader | input_readers.IsaacTeleopReader":
     """Create, start, and wait for readiness of the requested teleop input source."""
     if input_source == "isaac-teleop":
@@ -1585,6 +1588,8 @@ def _init_input_source(
         print("Using Isaac Teleop (in-process CloudXR / DeviceIO), waiting for data...")
         while reader.get_latest() is None:
             print("waiting for Isaac Teleop body data (connect the headset to CloudXR)...")
+            if waiting_callback is not None:
+                waiting_callback()
             time.sleep(1)
         return reader
 
@@ -1598,6 +1603,8 @@ def _init_input_source(
     print("Waiting for body tracking data...")
     while not xrt.is_body_data_available():
         print("waiting for body data...")
+        if waiting_callback is not None:
+            waiting_callback()
         time.sleep(1)
 
     reader = PicoReader(max_queue_size=buffer_size)
@@ -1922,14 +1929,56 @@ def run_pico_manager(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    voice_preflight: bool = False,
+    voice_interval_s: float = 10.0,
+    dry_run: bool = False,
+    voice_backend: str = "local",
+    voice_network_interface: str = "enP8p1s0",
+    voice_language: str = "en",
+    voice_speaker_id: int = 0,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
     Controller input:
       A+X: Toggle between planner and pose mode
+      A+B: Arm after the optional voice preflight passes
       A+B+X+Y: Toggle policy start/stop
     """
-    reader = _init_input_source(input_source, buffer_size)
+    voice = (
+        TextToSpeech(
+            backend=voice_backend,
+            network_interface=voice_network_interface,
+            speaker_id=voice_speaker_id,
+        )
+        if voice_preflight
+        else None
+    )
+    if voice is not None and not voice.available:
+        raise RuntimeError("--voice-preflight requested, but no speech backend is available")
+
+    def announce(message: str, message_zh: str | None = None) -> None:
+        print(message)
+        if voice is not None:
+            spoken = message_zh if voice_language == "zh" and message_zh else message
+            voice.say(spoken)
+
+    next_waiting_voice = 0.0
+
+    def announce_waiting_for_tracking() -> None:
+        nonlocal next_waiting_voice
+        if voice is None:
+            return
+        now = time.monotonic()
+        if now >= next_waiting_voice:
+            announce("Waiting for PICO body tracking", "正在等待PICO全身追踪，请打开遥操作应用")
+            next_waiting_voice = now + voice_interval_s
+
+    if voice is not None:
+        announce(
+            "Voice calibration assistant active. Put on PICO and start full body tracking",
+            "语音校准助手已启动。请戴上PICO并启动全身追踪",
+        )
+    reader = _init_input_source(input_source, buffer_size, announce_waiting_for_tracking)
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -1992,6 +2041,11 @@ def run_pico_manager(
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
     print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    preflight = XRPreflightMonitor() if voice_preflight else None
+    next_voice_report = time.monotonic()
+    policy_armed = not voice_preflight
+    arm_release_seen = not voice_preflight
+    arm_latched = False
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
@@ -2018,8 +2072,14 @@ def run_pico_manager(
             left_axis_click, right_axis_click = get_axis_clicks(reader)
             left_x_mgr, left_y_mgr, right_x_mgr, right_y_mgr = get_controller_axes(reader)
 
+            input_sample = reader.get_latest()
+            if preflight is not None and input_sample is not None:
+                preflight.update(
+                    input_sample["body_poses_np"],
+                    device_timestamp_ns=int(input_sample.get("timestamp_ns", 0)),
+                )
+
             if hasattr(socket, "record_input_sample"):
-                input_sample = reader.get_latest()
                 if input_sample is not None:
                     socket.record_input_sample(
                         input_sample["body_poses_np"],
@@ -2056,17 +2116,102 @@ def run_pico_manager(
                 (a_pressed, b_pressed, x_pressed, y_pressed)
             )
 
+            face_buttons = (a_pressed, b_pressed, x_pressed, y_pressed)
+            exact_arm_chord = a_pressed and b_pressed and not x_pressed and not y_pressed
+            arm_chord_event = exact_arm_chord and not arm_latched
+            if any(face_buttons):
+                if arm_chord_event:
+                    arm_latched = True
+            else:
+                arm_latched = False
+                if policy_armed and not arm_release_seen:
+                    arm_release_seen = True
+                    announce(
+                        "Calibration armed. Now ready to press A B X Y together",
+                        "校准已解锁。现在可以同时按下A键、B键、X键和Y键开始无动作演练",
+                    )
+
+            if voice is not None and preflight is not None:
+                now = time.monotonic()
+                current_status = preflight.status(now_monotonic=now)
+                if policy_armed and current_mode == StreamMode.OFF and not current_status.ready:
+                    policy_armed = False
+                    arm_release_seen = False
+                    announce(
+                        f"Calibration no longer valid. {current_status.message}",
+                        f"校准状态已失效。{current_status.message_zh}",
+                    )
+                if current_mode == StreamMode.OFF and now >= next_voice_report:
+                    if policy_armed:
+                        announce(
+                            "Calibration armed. Press A B X Y together to start the dry run"
+                            if dry_run
+                            else "Calibration armed. Press A B X Y together to start",
+                            "校准已解锁。请同时按下A键、B键、X键和Y键开始无动作演练"
+                            if dry_run
+                            else "校准已解锁。请同时按下A键、B键、X键和Y键开始",
+                        )
+                    else:
+                        announce(current_status.message, current_status.message_zh)
+                    next_voice_report = now + voice_interval_s
+
+                if current_mode == StreamMode.OFF and arm_chord_event:
+                    status = preflight.status(now_monotonic=now)
+                    if status.ready:
+                        policy_armed = True
+                        arm_release_seen = False
+                        announce(
+                            "Calibration accepted. Release all face buttons",
+                            "校准通过。请先松开所有按键",
+                        )
+                    else:
+                        policy_armed = False
+                        arm_release_seen = False
+                        announce(
+                            f"Cannot arm. {status.message}",
+                            f"无法解锁。{status.message_zh}",
+                        )
+
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
                 if start_combo_event:
-                    new_mode = StreamMode.PLANNER
-                    # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
-                    # Uses the current Pico SMPL frame + FK of all-zero body joints.
-                    sample = reader.get_latest()
-                    if sample is not None:
-                        three_point.calibrate_now(sample["body_poses_np"])
+                    start_status = (
+                        preflight.status(now_monotonic=time.monotonic())
+                        if preflight is not None
+                        else None
+                    )
+                    if voice_preflight and (
+                        not policy_armed
+                        or not arm_release_seen
+                        or start_status is None
+                        or not start_status.ready
+                    ):
+                        policy_armed = False
+                        arm_release_seen = False
+                        if voice is not None:
+                            announce(
+                                "Start blocked. Pass calibration, press A and B, release, then press all four buttons",
+                                "启动被阻止。请先完成校准，同时按下A键和B键，松开全部按键，再同时按下四个按键",
+                            )
                     else:
-                        print("[Manager] WARNING: No SMPL data available for calibration")
+                        new_mode = StreamMode.PLANNER
+                        if voice is not None:
+                            announce(
+                                "Robot dryrun policy starts. Next, press A and X to enter POSE"
+                                if dry_run
+                                else "Starting policy in planner mode",
+                                "机器人无动作演练策略开始。下一步，请同时按下A键和X键进入姿态模式"
+                                if dry_run
+                                else "策略开始，进入规划模式",
+                            )
+                        # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
+                        # Uses the current Pico SMPL frame + FK of all-zero body joints.
+                        if not dry_run:
+                            sample = reader.get_latest()
+                            if sample is not None:
+                                three_point.calibrate_now(sample["body_poses_np"])
+                            else:
+                                print("[Manager] WARNING: No SMPL data available for calibration")
 
             elif current_mode == StreamMode.PLANNER:
                 # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
@@ -2118,21 +2263,37 @@ def run_pico_manager(
 
             # Handle mode transitions before running loop
             if new_mode != current_mode:
-                if current_mode == StreamMode.POSE:
+                if current_mode == StreamMode.POSE and not dry_run:
                     pose_streamer.on_mode_exit()
+
+                if voice is not None and dry_run:
+                    if new_mode == StreamMode.POSE:
+                        announce(
+                            "Robot dry run enter POSE. Next, press A and X to leave POSE",
+                            "机器人无动作演练进入姿态模式。下一步，请再次同时按下A键和X键离开姿态模式",
+                        )
+                    elif current_mode == StreamMode.POSE and new_mode == StreamMode.PLANNER:
+                        announce(
+                            "Robot dry run leave POSE. Next, press A B X Y to stop",
+                            "机器人无动作演练离开姿态模式。下一步，请同时按下A键、B键、X键和Y键停止",
+                        )
 
                 # Track parent when entering VR_3PT
                 if new_mode == StreamMode.PLANNER_VR_3PT:
                     vr3pt_parent_mode = current_mode
                     print(f"[Manager] VR_3PT parent: {vr3pt_parent_mode.name}")
 
-                if new_mode == StreamMode.POSE:
+                if new_mode == StreamMode.POSE and not dry_run:
                     pose_streamer.reset_yaw()
-                elif new_mode == StreamMode.PLANNER and current_mode != StreamMode.PLANNER_VR_3PT:
+                elif (
+                    new_mode == StreamMode.PLANNER
+                    and current_mode != StreamMode.PLANNER_VR_3PT
+                    and not dry_run
+                ):
                     # Only reset yaw when freshly entering PLANNER from POSE,
                     # not when returning from VR_3PT sub-mode
                     planner_streamer.reset_yaw()
-                elif new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
+                elif new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY and not dry_run:
                     if current_mode != StreamMode.PLANNER_VR_3PT:
                         # Freshly entering from POSE: reset yaw and grab initial targets
                         planner_streamer.reset_yaw()
@@ -2140,7 +2301,7 @@ def run_pico_manager(
                     # whether entering from POSE or returning from VR_3PT
                     # (the old targets are stale after VR_3PT moved the arms)
                     planner_streamer.save_upper_body_position_target()
-                elif new_mode == StreamMode.PLANNER_VR_3PT:
+                elif new_mode == StreamMode.PLANNER_VR_3PT and not dry_run:
                     # Recalibrate VR tracking against the robot's actual current pose
                     # (read via g1_debug feedback + FK) to prevent sudden jumps
                     planner_streamer.recalibrate_for_vr3pt()
@@ -2148,7 +2309,9 @@ def run_pico_manager(
             # Run one iteration of the new mode
             if hasattr(socket, "set_mode"):
                 socket.set_mode(new_mode.name)
-            if new_mode == StreamMode.POSE:
+            if dry_run:
+                pass
+            elif new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
             elif (
                 new_mode == StreamMode.PLANNER
@@ -2160,17 +2323,24 @@ def run_pico_manager(
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
             if new_mode != current_mode:
                 if new_mode == StreamMode.OFF:
-                    socket.send(build_command_message(start=False, stop=True, planner=True))
+                    if dry_run:
+                        if voice is not None:
+                            announce(
+                                "Robot dry run policy stops. Dry run complete",
+                                "机器人无动作演练策略停止。演练完成",
+                            )
+                    else:
+                        socket.send(build_command_message(start=False, stop=True, planner=True))
                     print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                     current_mode = new_mode
                     return
-                elif (
+                elif not dry_run and (
                     new_mode == StreamMode.PLANNER
                     or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
                     or new_mode == StreamMode.PLANNER_VR_3PT
                 ):
                     socket.send(build_command_message(start=True, stop=False, planner=True))
-                elif new_mode == StreamMode.POSE:
+                elif not dry_run and new_mode == StreamMode.POSE:
                     socket.send(build_command_message(start=True, stop=False, planner=False))
 
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
@@ -2183,16 +2353,17 @@ def run_pico_manager(
             toggle_da = toggle_da_tmp and not prev_toggle_da
             prev_toggle_dc = toggle_dc_tmp
             prev_toggle_da = toggle_da_tmp
-            socket.send(
-                pack_pose_message(
-                    {
-                        "stream_mode": np.array([current_mode.value], dtype=np.int32),
-                        "toggle_data_collection": np.array([toggle_dc], dtype=bool),
-                        "toggle_data_abort": np.array([toggle_da], dtype=bool),
-                    },
-                    topic="manager_state",
+            if not dry_run:
+                socket.send(
+                    pack_pose_message(
+                        {
+                            "stream_mode": np.array([current_mode.value], dtype=np.int32),
+                            "toggle_data_collection": np.array([toggle_dc], dtype=bool),
+                            "toggle_data_abort": np.array([toggle_da], dtype=bool),
+                        },
+                        topic="manager_state",
+                    )
                 )
-            )
 
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed
@@ -2206,6 +2377,8 @@ def run_pico_manager(
         if input_source == "xrt" and xrt is not None:
             xrt.close()
         three_point.close()
+        if voice is not None:
+            voice.close()
         socket.close()
         context.term()
         print("[Manager] Shutdown complete")
@@ -2310,6 +2483,48 @@ if __name__ == "__main__":
             "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
         ),
     )
+    parser.add_argument(
+        "--voice-preflight",
+        action="store_true",
+        help=(
+            "Speak live tracking/stance status and require a passing input-only "
+            "preflight plus A+B arm chord before A+B+X+Y can start policy"
+        ),
+    )
+    parser.add_argument(
+        "--voice-interval-s",
+        type=float,
+        default=10.0,
+        help="Seconds between voice preflight reports (default: 10)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Exercise headset input, voice, and mode controls without sending ZMQ packets",
+    )
+    parser.add_argument(
+        "--voice-backend",
+        choices=["local", "unitree"],
+        default="local",
+        help="Voice output: local audio sink or the Unitree G1 head speaker",
+    )
+    parser.add_argument(
+        "--voice-network-interface",
+        default="enP8p1s0",
+        help="DDS network interface for --voice-backend unitree",
+    )
+    parser.add_argument(
+        "--voice-language",
+        choices=["en", "zh"],
+        default="en",
+        help="Language sent to the selected voice backend; terminal logs remain English",
+    )
+    parser.add_argument(
+        "--voice-speaker-id",
+        type=int,
+        default=0,
+        help="Unitree TTS speaker ID: 0 Chinese, 1 English",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2352,6 +2567,13 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            voice_preflight=args.voice_preflight,
+            voice_interval_s=args.voice_interval_s,
+            dry_run=args.dry_run,
+            voice_backend=args.voice_backend,
+            voice_network_interface=args.voice_network_interface,
+            voice_language=args.voice_language,
+            voice_speaker_id=args.voice_speaker_id,
         )
     else:
         # Run legacy single-thread pose streaming

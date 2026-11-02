@@ -3,18 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import math
-
 import numpy as np
 
 from gear_sonic.utils.teleop.zmq.packet_capture import iter_input_samples
-
-
-def knee_angle_deg(hip: np.ndarray, knee: np.ndarray, ankle: np.ndarray) -> float:
-    upper = hip - knee
-    lower = ankle - knee
-    cosine = np.dot(upper, lower) / (np.linalg.norm(upper) * np.linalg.norm(lower))
-    return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+from gear_sonic.utils.teleop.xr_preflight import knee_angle_deg
 
 
 def main() -> None:
@@ -51,7 +43,7 @@ def main() -> None:
         f"right_knee_deg={min(right_knees):.2f}..{max(right_knees):.2f}; "
         f"pose_component_range={pose_component_range:.6g}; pressed_samples={pressed}"
     )
-    if not math.isfinite(duration_s) or duration_s < args.min_duration_s:
+    if not np.isfinite(duration_s) or duration_s < args.min_duration_s:
         raise SystemExit(f"capture duration {duration_s:.3f}s is below required minimum")
     if gaps_ms.max() > args.max_device_gap_ms:
         raise SystemExit(f"device gap {gaps_ms.max():.3f}ms exceeds limit")
